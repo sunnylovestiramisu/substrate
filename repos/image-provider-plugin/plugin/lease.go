@@ -165,6 +165,10 @@ func (d *Driver) prepareImageCold(ctx context.Context, req *client.PrepareReques
 
 	canonicalRef := CanonicalImageRef(ref, meta.digest)
 	imageWorkDir := d.imageWorkDir(ref)
+	// A rootfs left from an earlier preparation merges the old layer views.
+	if err := d.removeRootfs(imageWorkDir); err != nil {
+		return nil, err
+	}
 	env := &MountEnv{
 		Driver:       d,
 		Client:       snapClient,
@@ -407,9 +411,17 @@ func (d *Driver) finishLeaseTeardown(ctx context.Context, lease *imageLease, fli
 	d.notifyDrainedLocked()
 }
 
-// teardownWorkDir runs the teardown hook, removes the snapshots in mounted,
-// and removes workDir.
+// teardownWorkDir removes the rootfs, runs the teardown hook, removes the
+// snapshots in mounted, and removes workDir. It leaves workDir in place if
+// the rootfs cannot be unmounted, and a later sweep tries again.
 func (d *Driver) teardownWorkDir(ctx context.Context, workDir string, mounted *MountedLayers) {
+	if err := d.removeRootfs(workDir); err != nil {
+		slog.WarnContext(ctx, "Failed to remove the rootfs of an image work dir",
+			slog.String("provider", d.name),
+			slog.String("workDir", workDir),
+			slog.Any("err", err))
+		return
+	}
 	if d.workDirTeardownHook != nil {
 		d.workDirTeardownHook(workDir)
 	}

@@ -69,7 +69,7 @@ func (s *Server) CanProvide(ctx context.Context, req *imageprovider.CanProvideRe
 	if s.driver.Draining() {
 		state = imageprovider.PluginState_PLUGIN_STATE_DRAINING
 	}
-	if !isDirsForm(req.GetForm()) {
+	if !isServedForm(req.GetForm()) {
 		ok = false
 	}
 	return &imageprovider.CanProvideResponse{
@@ -84,12 +84,17 @@ func isDirsForm(form imageprovider.LayerForm) bool {
 	return form == imageprovider.LayerForm_LAYER_FORM_UNSPECIFIED || form == imageprovider.LayerForm_LAYER_FORM_DIRS
 }
 
+// isServedForm reports whether the server returns layers in form.
+func isServedForm(form imageprovider.LayerForm) bool {
+	return isDirsForm(form) || form == imageprovider.LayerForm_LAYER_FORM_ROOTFS
+}
+
 // PrepareImage prepares the image's layers and takes a lease on them. It
 // returns FailedPrecondition when the driver declines the image, and
-// Unimplemented for a layer form other than directories.
+// Unimplemented for LAYER_FORM_EROFS.
 func (s *Server) PrepareImage(ctx context.Context, req *imageprovider.PrepareImageRequest) (*imageprovider.PrepareImageResponse, error) {
-	if !isDirsForm(req.GetForm()) {
-		return nil, status.Error(codes.Unimplemented, "only LAYER_FORM_DIRS is supported")
+	if !isServedForm(req.GetForm()) {
+		return nil, status.Errorf(codes.Unimplemented, "%s is not supported", req.GetForm())
 	}
 	prepReq := &client.PrepareRequest{ImageRef: req.GetImageRef()}
 	if a := req.GetAuth(); a != nil {
@@ -102,7 +107,16 @@ func (s *Server) PrepareImage(ctx context.Context, req *imageprovider.PrepareIma
 			RegistryToken: a.GetRegistryToken(),
 		}
 	}
-	res, err := s.driver.PrepareImage(ctx, prepReq)
+	var (
+		res       *client.PrepareResult
+		rootfsDir string
+		err       error
+	)
+	if isDirsForm(req.GetForm()) {
+		res, err = s.driver.PrepareImage(ctx, prepReq)
+	} else {
+		res, rootfsDir, err = s.driver.PrepareRootfs(ctx, prepReq)
+	}
 	if errors.Is(err, client.ErrNotSupported) {
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
@@ -113,14 +127,20 @@ func (s *Server) PrepareImage(ctx context.Context, req *imageprovider.PrepareIma
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "encoding image config: %v", err)
 	}
-	return &imageprovider.PrepareImageResponse{
+	resp := &imageprovider.PrepareImageResponse{
 		ImageDigest:  res.ImageDigest,
 		ConfigJson:   cfg,
 		ProviderName: res.ProviderName,
 		Layers: &imageprovider.PrepareImageResponse_LayerDirs{
 			LayerDirs: &imageprovider.LayerDirs{Dirs: res.LayerDirs},
 		},
-	}, nil
+	}
+	if rootfsDir != "" {
+		resp.Layers = &imageprovider.PrepareImageResponse_Rootfs{
+			Rootfs: &imageprovider.Rootfs{Dir: rootfsDir},
+		}
+	}
+	return resp, nil
 }
 
 // ReleaseImage releases one lease on the image.

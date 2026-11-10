@@ -24,7 +24,8 @@ default:
   state. A draining plugin reports `PLUGIN_STATE_DRAINING`.
 - `PrepareImage` prepares an image's layers and takes a lease on them. It returns
   the image digest, its config, and one host directory per layer, bottom first,
-  each with the layer's tree under `fs/`.
+  each with the layer's tree under `fs/`. For `LAYER_FORM_ROOTFS` it returns
+  one merged read-only root filesystem directory instead.
 - `ReleaseImage` releases one lease.
 - `ReconcileImages` replaces the plugin's leases with the images that workloads
   still use, after atelet or the plugin restarts.
@@ -57,6 +58,13 @@ default, and counts leases per image. The work dir must be under
 providers: `WithLayerMounter` replaces `StandardMountLayers`, `WithProbeHook`
 adds a health check, and `WithWarmHitHook` and `WithWorkDirTeardownHook` run
 when an image is reused or removed.
+
+For `LAYER_FORM_ROOTFS`, the driver merges the layers in
+`<work dir>/<image key>/rootfs`: a symlink to `layer-0/fs` for a single layer,
+and a read-only overlayfs of the layers otherwise. It unmounts the rootfs
+before it removes the layers. `WithRootfsMounter` replaces the overlayfs
+mounter. The plugin container that mounts it needs `Bidirectional` mount
+propagation on `/var/lib/ate`.
 
 ## Development
 

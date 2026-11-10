@@ -89,6 +89,7 @@ func (d *Driver) ReconcileImages(ctx context.Context, active []*client.ActiveIma
 	}
 
 	keep := make(map[string]bool)
+	var inUse []*imageLease
 	d.mu.Lock()
 	for ref := range d.inflight {
 		keep[d.imageWorkDir(ref)] = true
@@ -129,6 +130,7 @@ func (d *Driver) ReconcileImages(ctx context.Context, active []*client.ActiveIma
 		}
 		stopIdleTimer(lease)
 		lease.refCount = n
+		inUse = append(inUse, lease)
 		slog.InfoContext(ctx, "Reconciled image lease",
 			slog.String("provider", d.name),
 			slog.String("image", ref),
@@ -156,7 +158,24 @@ func (d *Driver) ReconcileImages(ctx context.Context, active []*client.ActiveIma
 		d.finishLeaseTeardown(ctx, o.lease, o.flight)
 	}
 	d.sweepOrphanWorkDirs(ctx, keep)
+	for _, lease := range inUse {
+		d.restoreRootfs(ctx, lease)
+	}
 	return nil
+}
+
+// restoreRootfs checks the rootfs of an image in use, if it has one, and
+// mounts it again if it is broken.
+func (d *Driver) restoreRootfs(ctx context.Context, lease *imageLease) {
+	if _, err := os.Lstat(filepath.Join(lease.workDir, rootfsDirName)); err != nil {
+		return
+	}
+	if _, err := d.ensureRootfs(lease.workDir, lease.layers); err != nil {
+		slog.WarnContext(ctx, "Failed to restore the rootfs of an image in use",
+			slog.String("provider", d.name),
+			slog.String("image", lease.imageRef),
+			slog.Any("err", err))
+	}
 }
 
 // imageWorkDir returns the directory that holds ref's layer directories.

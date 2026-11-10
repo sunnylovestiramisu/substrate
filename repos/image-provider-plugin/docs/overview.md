@@ -29,6 +29,11 @@ cache.
 image, and remembers declined images for a while, so a declined image does not
 cost a round trip to the registry on every start.
 
+A caller that cannot stack layers itself, such as a gVisor sandbox with a bind
+rootfs, asks for `LAYER_FORM_ROOTFS`. The driver then also merges the layers
+into one read-only directory, `rootfs`, beside the layer directories, and keeps
+it while the image is mounted.
+
 ## Leases
 
 Each `PrepareImage` takes a lease, and each `ReleaseImage` returns one. atelet

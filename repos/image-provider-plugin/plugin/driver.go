@@ -265,6 +265,7 @@ type Driver struct {
 	warmHitHook         WarmHitHookFunc
 	workDirTeardownHook WorkDirTeardownHookFunc
 	probeHook           ProbeHookFunc
+	rootfsMounter       RootfsMounter
 	declineTTL          time.Duration
 	startupTimeout      time.Duration
 	drainTimeout        time.Duration
@@ -288,6 +289,8 @@ type Driver struct {
 	declined   map[string]time.Time
 	inflight   map[string]*inflightPrep
 	chainLocks map[string]*sync.Mutex
+	// rootfsLocks guard the rootfs of each image work dir.
+	rootfsLocks map[string]*sync.Mutex
 }
 
 // NewDriver returns a Driver for the provider name, whose snapshotter
@@ -311,6 +314,8 @@ func NewDriver(name, defaultSocket, snapshotterName string, opts ...Option) (*Dr
 		declined:        make(map[string]time.Time),
 		inflight:        make(map[string]*inflightPrep),
 		chainLocks:      make(map[string]*sync.Mutex),
+		rootfsLocks:     make(map[string]*sync.Mutex),
+		rootfsMounter:   OverlayMounter{},
 	}
 	for _, opt := range opts {
 		opt(d)
