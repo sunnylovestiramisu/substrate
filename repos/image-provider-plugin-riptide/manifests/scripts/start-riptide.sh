@@ -92,6 +92,13 @@ if [[ -n "${clear_reason}" ]]; then
   echo "Clearing the layer cache: ${clear_reason}"
   rm -rf "${gcfs_root}/snapshotter/layers"
 fi
+# Unmount the merged rootfs overlays the plugin mounts for LAYER_FORM_ROOTFS,
+# so rm does not walk into them. A single-layer rootfs is a symlink.
+for rootfs in "${plugin_work_dir}"/*/rootfs; do
+  if [[ -d "${rootfs}" && ! -L "${rootfs}" ]] && mountpoint -q "${rootfs}"; then
+    umount -l "${rootfs}"
+  fi
+done
 rm -rf "${gcfs_root}/gcfsd" "${gcfs_root}/gcfsd_sentinel.txt" \
   "${gcfs_root}/snapshotter/metadata.db" "${gcfs_root}/snapshotter/snapshots" \
   "${plugin_work_dir:?}"/*
