@@ -38,6 +38,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"google.golang.org/grpc"
@@ -416,5 +418,98 @@ func TestPrepareImageDeclinesNonNydusImages(t *testing.T) {
 				t.Fatalf("PrepareImage = %v, want ErrNotSupported", err)
 			}
 		})
+	}
+}
+
+// TestRegistryReadsPerImage checks the registry requests of resolving an
+// image, reading its annotations and fetching its bootstrap: one manifest
+// GET per image, and one ping per transport for all images.
+func TestRegistryReadsPerImage(t *testing.T) {
+	var pings, manifests atomic.Int64
+	reg := registry.New()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v2/":
+			pings.Add(1)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/"):
+			manifests.Add(1)
+		}
+		reg.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	repo, err := name.NewRepository(strings.TrimPrefix(srv.URL, "http://") + "/sandbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type image struct{ ref, bootstrap string }
+	var images []image
+	for _, content := range []string{"one", "two"} {
+		layer, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(layerTar(t, map[string]string{"image/image.boot": content}))), nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		img, err := mutate.Append(empty.Image, mutate.Addendum{
+			Layer:       layer,
+			Annotations: map[string]string{labelNydusBootstrap: "true", labelNydusFSVersion: "6"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err := img.Digest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref := repo.Digest(d.String())
+		if err := remote.Write(ref, img); err != nil {
+			t.Fatal(err)
+		}
+		ld, err := layer.Digest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		images = append(images, image{ref: ref.String(), bootstrap: ld.String()})
+	}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp, err := http.Get(r.Header.Get("X-Dragonfly-Registry") + r.URL.Path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	defer proxy.Close()
+	pings.Store(0)
+	manifests.Store(0)
+
+	d := newTestDriver(t, config{DragonflyProxyAddr: proxy.URL}, &fakeNydusSnapshots{committed: make(map[string]bool)})
+	auth := &client.AuthConfig{Username: "_token", Password: "secret"}
+	for _, img := range images {
+		if _, _, _, _, err := d.resolveImage(t.Context(), img.ref, auth); err != nil {
+			t.Fatalf("resolveImage(%s): %v", img.ref, err)
+		}
+		anns, err := d.imageAnnotations(t.Context(), img.ref, auth)
+		if err != nil || len(anns) != 1 || anns[0][labelNydusBootstrap] != "true" {
+			t.Fatalf("imageAnnotations(%s) = (%v, %v), want the bootstrap layer", img.ref, anns, err)
+		}
+		rc, err := d.registryLayerReader(t.Context(), img.ref, auth, 0, img.bootstrap)
+		if err != nil {
+			t.Fatalf("registryLayerReader(%s): %v", img.ref, err)
+		}
+		_, err = io.Copy(io.Discard, rc)
+		_ = rc.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := manifests.Load(), int64(len(images)); got != want {
+		t.Errorf("manifest GETs = %d, want %d", got, want)
+	}
+	// One session for registry reads and one for reads through the proxy.
+	if got := pings.Load(); got != 2 {
+		t.Errorf("pings = %d, want 2", got)
 	}
 }

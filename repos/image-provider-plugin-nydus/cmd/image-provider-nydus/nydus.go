@@ -232,10 +232,8 @@ func newNydusDriver(cfg config) (*nydusDriver, error) {
 		plugin.WithWarmHitHook(nd.onWarmHit),
 		plugin.WithWorkDirTeardownHook(nd.unmountWorkDir),
 		plugin.WithProbeHook(nd.probeDragonfly),
+		plugin.WithImageResolver(nd.resolveImage),
 	}, cfg.DriverOpts...)
-	if nd.blobSeedURL != "" {
-		opts = append(opts, plugin.WithImageResolver(nd.resolveImage))
-	}
 	d, err := plugin.NewDriver(providerName, defaultSnapshotterSocket, "nydus", opts...)
 	if err != nil {
 		return nil, err
@@ -510,23 +508,33 @@ func (nd *nydusDriver) imageAnnotations(ctx context.Context, imageRef string, au
 	if err != nil {
 		return nil, err
 	}
+	if err := nd.cacheAnnotations(imageRef, anns); err != nil {
+		return nil, err
+	}
+	return anns, nil
+}
+
+// cacheAnnotations caches the layer annotations of imageRef. It returns an
+// error wrapping client.ErrNotSupported, and caches nothing, unless they
+// describe a Nydus RAFS v6 image.
+func (nd *nydusDriver) cacheAnnotations(imageRef string, anns []map[string]string) error {
 	hasBootstrap := false
 	for _, ann := range anns {
 		if ann[labelNydusBootstrap] != "true" {
 			continue
 		}
 		if v := ann[labelNydusFSVersion]; v != "" && v != "6" {
-			return nil, fmt.Errorf("image %s is RAFS v%s, want v6: %w", imageRef, v, client.ErrNotSupported)
+			return fmt.Errorf("image %s is RAFS v%s, want v6: %w", imageRef, v, client.ErrNotSupported)
 		}
 		hasBootstrap = true
 	}
 	if !hasBootstrap {
-		return nil, fmt.Errorf("image %s is not a Nydus RAFS v6 image: %w", imageRef, client.ErrNotSupported)
+		return fmt.Errorf("image %s is not a Nydus RAFS v6 image: %w", imageRef, client.ErrNotSupported)
 	}
 	nd.mu.Lock()
 	nd.annotations[imageRef] = anns
 	nd.mu.Unlock()
-	return anns, nil
+	return nil
 }
 
 // layerLabels returns the snapshot labels containerd-nydus-grpc needs for
@@ -567,7 +575,12 @@ func (nd *nydusDriver) registryLayerAnnotations(ctx context.Context, imageRef st
 		}
 		logSeedMiss(ctx, "manifest", imageRef, err)
 	}
-	img, err := remote.Image(ref, plugin.RemoteOptions(ctx, nd.Keychain(), auth)...)
+	opts, done, err := nd.RemoteOptions(ctx, auth, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	img, err := remote.Image(ref, opts...)
+	done(err)
 	if err != nil {
 		return nil, fmt.Errorf("fetching image %s: %w", imageRef, err)
 	}
@@ -610,8 +623,12 @@ func (nd *nydusDriver) registryLayerReader(ctx context.Context, imageRef string,
 		}
 		logSeedMiss(ctx, "layer "+layerDigest, imageRef, err)
 	}
-	opts := append(plugin.RemoteOptions(ctx, nd.Keychain(), auth), remote.WithTransport(nd.blobTransport))
+	opts, done, err := nd.RemoteOptions(ctx, auth, "dragonfly", nd.blobTransport)
+	if err != nil {
+		return nil, err
+	}
 	layer, err := remote.Layer(ref.Context().Digest(layerDigest), opts...)
+	done(err)
 	if err != nil {
 		return nil, fmt.Errorf("fetching layer %s of %s: %w", layerDigest, imageRef, err)
 	}

@@ -30,7 +30,6 @@ import (
 	"time"
 
 	"github.com/ai-on-gke/image-provider-plugin/client"
-	"github.com/ai-on-gke/image-provider-plugin/plugin"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
@@ -152,31 +151,32 @@ func logSeedMiss(ctx context.Context, what, ref string, err error) {
 		slog.String("what", what), slog.String("ref", ref), slog.Any("err", err))
 }
 
-// resolveImage resolves an image from the blob seeds, then from the
-// registry.
+// resolveImage resolves an image from the blob seeds, if set, then from the
+// registry. It caches the layer annotations of a Nydus manifest, so
+// preparing the image does not fetch the manifest again.
 func (nd *nydusDriver) resolveImage(ctx context.Context, refStr string, auth *client.AuthConfig) (string, *v1.Config, []string, []string, error) {
 	ref, err := name.ParseReference(refStr)
 	if err != nil {
 		return "", nil, nil, nil, fmt.Errorf("parsing reference %q: %w", refStr, err)
 	}
-	digest, m, cfg, err := nd.seedImage(ctx, ref)
-	if err != nil {
-		logSeedMiss(ctx, "image", refStr, err)
-		img, err := remote.Image(ref, plugin.RemoteOptions(ctx, nd.Keychain(), auth)...)
+	var digest string
+	var m *v1.Manifest
+	var cfg *v1.ConfigFile
+	if nd.blobSeedURL != "" {
+		digest, m, cfg, err = nd.seedImage(ctx, ref)
 		if err != nil {
-			return "", nil, nil, nil, fmt.Errorf("fetching image %s: %w", refStr, err)
+			logSeedMiss(ctx, "image", refStr, err)
 		}
-		d, err := img.Digest()
-		if err != nil {
-			return "", nil, nil, nil, fmt.Errorf("reading the image digest: %w", err)
+	}
+	if m == nil {
+		if digest, m, cfg, err = nd.registryImage(ctx, ref, auth); err != nil {
+			return "", nil, nil, nil, err
 		}
-		if cfg, err = img.ConfigFile(); err != nil {
-			return "", nil, nil, nil, fmt.Errorf("reading the image config: %w", err)
-		}
-		if m, err = img.Manifest(); err != nil {
-			return "", nil, nil, nil, fmt.Errorf("reading the image manifest: %w", err)
-		}
-		digest = d.String()
+	}
+	// Preparing an image that is not Nydus RAFS v6 reads its annotations
+	// again and declines it.
+	if err := nd.cacheAnnotations(refStr, manifestAnnotations(m)); err != nil && !errors.Is(err, client.ErrNotSupported) {
+		return "", nil, nil, nil, err
 	}
 	layerDigests := make([]string, len(m.Layers))
 	for i, l := range m.Layers {
@@ -187,6 +187,33 @@ func (nd *nydusDriver) resolveImage(ctx context.Context, refStr string, auth *cl
 		diffIDs[i] = diff.String()
 	}
 	return digest, &cfg.Config, diffIDs, layerDigests, nil
+}
+
+// registryImage reads the digest, manifest and config of an image from its
+// registry.
+func (nd *nydusDriver) registryImage(ctx context.Context, ref name.Reference, auth *client.AuthConfig) (string, *v1.Manifest, *v1.ConfigFile, error) {
+	opts, done, err := nd.RemoteOptions(ctx, auth, "", nil)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	img, err := remote.Image(ref, opts...)
+	done(err)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("fetching image %s: %w", ref, err)
+	}
+	d, err := img.Digest()
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("reading the image digest: %w", err)
+	}
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("reading the image config: %w", err)
+	}
+	m, err := img.Manifest()
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("reading the image manifest: %w", err)
+	}
+	return d.String(), m, cfg, nil
 }
 
 // seedImage reads the manifest and config of a digest reference from the

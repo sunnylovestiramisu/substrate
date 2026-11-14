@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"sync"
 	"time"
@@ -270,6 +271,7 @@ type Driver struct {
 	startupTimeout      time.Duration
 	drainTimeout        time.Duration
 	clientInjected      bool
+	pullers             *pullerCache
 
 	mu       sync.Mutex
 	closed   bool
@@ -316,6 +318,7 @@ func NewDriver(name, defaultSocket, snapshotterName string, opts ...Option) (*Dr
 		chainLocks:      make(map[string]*sync.Mutex),
 		rootfsLocks:     make(map[string]*sync.Mutex),
 		rootfsMounter:   OverlayMounter{},
+		pullers:         newPullerCache(defaultPullerTTL, defaultMaxPullers),
 	}
 	for _, opt := range opts {
 		opt(d)
@@ -356,6 +359,17 @@ func (d *Driver) Keychain() authn.Keychain {
 		return d.keychain
 	}
 	return authn.NewMultiKeychain(google.Keychain, authn.DefaultKeychain)
+}
+
+// RemoteOptions returns the options for a registry call. They authenticate
+// with authConfig, then the driver's Keychain, and send requests over
+// transport, or remote.DefaultTransport when transport is nil. Calls with the
+// same credentials and transportName share one registry session, so they
+// ping the registry and fetch a bearer token once per repository. Call done
+// with the error of the remote.Image, remote.Layer or similar call that used
+// the options.
+func (d *Driver) RemoteOptions(ctx context.Context, authConfig *client.AuthConfig, transportName string, transport http.RoundTripper) (opts []remote.Option, done func(error), err error) {
+	return d.pullers.options(ctx, d.Keychain(), authConfig, transportName, transport)
 }
 
 // WithNamespaceContext adds the containerd namespace header to ctx.
@@ -414,7 +428,12 @@ func (d *Driver) defaultImageResolver(ctx context.Context, refStr string, authCo
 	if err != nil {
 		return "", nil, nil, nil, fmt.Errorf("parsing reference %q: %w", refStr, err)
 	}
-	img, err := remote.Image(ref, RemoteOptions(ctx, d.keychain, authConfig)...)
+	opts, done, err := d.RemoteOptions(ctx, authConfig, "", nil)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	img, err := remote.Image(ref, opts...)
+	done(err)
 	if err != nil {
 		return "", nil, nil, nil, fmt.Errorf("fetching image: %w", err)
 	}
